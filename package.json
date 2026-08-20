@@ -1,0 +1,15 @@
+{
+  "name": "lazada-stock-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monitors Lazada SG product pages and auto-adds items to cart when back in stock",
+  "type": "module",
+  "scripts": {
+    "login": "node src/login.js",
+    "start": "node src/monitor.js",
+    "test:notify": "node src/notify.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}

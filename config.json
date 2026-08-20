@@ -1,0 +1,47 @@
+{
+  "baseUrl": "https://www.lazada.sg",
+  "headless": true,
+  "pollIntervalSeconds": 10,
+  "blockImages": true,
+  "schedule": {
+    "enabled": true,
+    "startTime": "12:30",
+    "endTime": "15:00",
+    "timezone": "Asia/Singapore"
+  },
+  "notifications": {
+    "sound": false,
+    "desktop": true,
+    "telegram": {
+      "enabled": true,
+      "botToken": "8984170417:AAFuiA-f3lZE72SeriUKe_Q9tLvZEmgVoDc",
+      "chatId": "524215075"
+    }
+  },
+  "products": [
+    {
+      "name": "First Partners Series 3",
+      "url": "https://www.lazada.sg/products/pokemon-trading-card-game-first-partner-illustration-collection-series-3-limit-1-per-person-i13786865113-s124779216330.html",
+      "quantity": 1,
+      "variantLabel": null
+    },
+    {
+      "name": "Pokémon Mega Evolution - Pitch Black Pokémon Center ETB",
+      "url": "https://www.lazada.sg/products/pokemon-trading-card-game-mega-evolution-pitch-black-pokemon-center-elite-trainer-box-limit-2-per-person-i13771481735-s124743721305.html",
+      "quantity": 1,
+      "variantLabel": null
+    }
+  ],
+  "snipeTargets": [
+    {
+      "enabled": false,
+      "name": "Pokémon 30th Anniversary Drop",
+      "storeUrl": "https://www.lazada.sg/shop/pokemon-store-online-singapore/?tab=products",
+      "keywords": ["30th Anniversary"],
+      "excludeKeywords": [],
+      "quantity": 1,
+      "variantLabel": null
+    }
+  ]
+}
+
