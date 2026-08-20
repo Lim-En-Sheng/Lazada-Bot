@@ -1,5 +1,18 @@
 import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+// Load .env file if it exists (no external packages needed — Node 20.6+ native)
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const envPath = path.join(__dirname, '..', '.env');
+if (existsSync(envPath)) {
+  try {
+    process.loadEnvFile(envPath);
+  } catch {
+    // Ignore if not supported
+  }
+}
 
 let cachedConfig = null;
 export function getConfig() {
@@ -7,7 +20,19 @@ export function getConfig() {
   try {
     const configPath = new URL('../config.json', import.meta.url);
     if (existsSync(configPath)) {
-      cachedConfig = JSON.parse(readFileSync(configPath, 'utf8'));
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+
+      // Override Telegram credentials from environment variables if set
+      if (raw.notifications?.telegram) {
+        if (process.env.TELEGRAM_BOT_TOKEN) {
+          raw.notifications.telegram.botToken = process.env.TELEGRAM_BOT_TOKEN;
+        }
+        if (process.env.TELEGRAM_CHAT_ID) {
+          raw.notifications.telegram.chatId = process.env.TELEGRAM_CHAT_ID;
+        }
+      }
+
+      cachedConfig = raw;
     }
   } catch {
     cachedConfig = {};

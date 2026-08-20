@@ -14,8 +14,8 @@
     "desktop": true,
     "telegram": {
       "enabled": true,
-      "botToken": "8984170417:AAFuiA-f3lZE72SeriUKe_Q9tLvZEmgVoDc",
-      "chatId": "524215075"
+      "botToken": "",
+      "chatId": ""
     }
   },
   "products": [
