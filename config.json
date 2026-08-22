@@ -3,11 +3,9 @@
   "headless": true,
   "pollIntervalSeconds": 10,
   "blockImages": true,
-  "schedule": {
-    "enabled": true,
-    "startTime": "12:30",
-    "endTime": "15:00",
-    "timezone": "Asia/Singapore"
+  "health": {
+    "slowCycleSeconds": 60,
+    "consecutiveErrorAlertThreshold": 3
   },
   "notifications": {
     "sound": false,
@@ -37,11 +35,12 @@
       "enabled": false,
       "name": "Pokémon 30th Anniversary Drop",
       "storeUrl": "https://www.lazada.sg/shop/pokemon-store-online-singapore/?tab=products",
-      "keywords": ["30th Anniversary"],
+      "keywords": [
+        "30th Anniversary"
+      ],
       "excludeKeywords": [],
       "quantity": 1,
       "variantLabel": null
     }
   ]
 }
-

@@ -2,14 +2,53 @@ import { readFileSync } from 'node:fs';
 import { launch, saveSession, randomDelay, DATA_DIR } from './browser.js';
 import { notify } from './notify.js';
 
-const config = JSON.parse(readFileSync(new URL('../config.json', import.meta.url), 'utf8'));
+const configUrl = new URL('../config.json', import.meta.url);
+let config = JSON.parse(readFileSync(configUrl, 'utf8'));
 
 const once = process.argv.includes('--once');
-const pollIntervalMs = (config.pollIntervalSeconds || 25) * 1000;
+let pollIntervalMs = (config.pollIntervalSeconds || 25) * 1000;
 const status = new Map();
 let wasLoggedIn = null;
 let lastKeepAliveTime = 0;
 const KEEP_ALIVE_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+let pendingProductCheck = null;
+let currentCycleErrors = 0;
+let consecutiveErrorCycles = 0;
+let errorAlertActive = false;
+let lastSlowCycleAlert = 0;
+
+const runtimeStats = {
+  startedAt: new Date().toISOString(),
+  cycles: 0,
+  productChecks: 0,
+  errors: 0,
+  restocks: 0,
+  captchas: 0,
+  currentProduct: null,
+  lastSuccessfulCycleAt: null,
+  lastCycleDurationMs: null,
+  slowestProduct: null,
+  lastCaptchaAt: null,
+};
+
+function sendControllerMessage(message) {
+  if (typeof process.send === 'function' && process.connected) {
+    process.send(message, () => {});
+  }
+}
+
+function sendTelemetry(extra = {}) {
+  sendControllerMessage({
+    type: 'telemetry',
+    snapshot: {
+      ...runtimeStats,
+      enabledProducts: activeProducts?.length || 0,
+      enabledSnipeTargets: activeSnipeTargets?.length || 0,
+      browserMode: runtimeHeadless ? 'headless' : 'visible',
+      ...extra,
+    },
+  });
+}
 
 function log(msg) {
   console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
@@ -118,6 +157,10 @@ async function detectStock(page, product) {
       `Lazada requires manual verification for ${product.name}. Please solve it in the browser window!`,
       { url: product.url, time: new Date().toLocaleTimeString() }
     );
+    runtimeStats.captchas += 1;
+    runtimeStats.lastCaptchaAt = new Date().toISOString();
+    sendControllerMessage({ type: 'captcha', product: product.name, at: runtimeStats.lastCaptchaAt });
+    await waitForManualCaptchaResolution(page.url() || product.url);
     return 'captcha';
   }
 
@@ -244,6 +287,20 @@ async function keepAlive(page) {
           : '⚠️ WARNING: Session looks logged OUT — re-run "npm run login".'
       );
     }
+    if (loggedIn !== wasLoggedIn) {
+      sendControllerMessage({ type: 'login-status', loggedIn });
+    }
+    if (loggedIn !== wasLoggedIn) {
+      if (!loggedIn) {
+        notify('LAZADA LOGIN REQUIRED', 'The saved Lazada session appears to be logged out. Run npm run login on the PC.', {
+          time: new Date().toLocaleTimeString(),
+        });
+      } else if (wasLoggedIn === false) {
+        notify('LAZADA LOGIN RESTORED', 'The Lazada session is logged in again and monitoring can continue.', {
+          time: new Date().toLocaleTimeString(),
+        });
+      }
+    }
     wasLoggedIn = loggedIn;
   } catch (err) {
     if (err.message.includes('ERR_ABORTED') || err.message.includes('frame was detached')) {
@@ -267,8 +324,12 @@ async function checkProduct(page, product) {
       log(`🎉 ${product.name}: IN STOCK!`);
       if (prev !== 'in') {
         log(`${product.name}: Restock detected — adding to cart...`);
-        await addToCart(page, product);
-        notify('IN STOCK', `${product.name} was added to your Lazada cart. Check out now!`, {
+        const addedToCart = await addToCart(page, product);
+        runtimeStats.restocks += 1;
+        sendControllerMessage({ type: 'restock', product: product.name, addedToCart });
+        notify(addedToCart ? 'IN STOCK — ADDED TO CART' : 'IN STOCK — CART FAILED', addedToCart
+          ? `${product.name} was added to your Lazada cart. Check out now!`
+          : `${product.name} is in stock, but the bot could not confirm that it was added to the cart. Open Lazada now.`, {
           url: product.url,
           time: new Date().toLocaleTimeString(),
         });
@@ -279,9 +340,16 @@ async function checkProduct(page, product) {
       log(`${product.name}: Unknown stock state — page structure may have changed or is loading slowly.`);
     }
     status.set(product.url, stock);
+    return stock;
   } catch (err) {
+    if (err instanceof CaptchaResolvedError) {
+      throw err;
+    }
     log(`ERROR checking ${product.name}: ${err.message}`);
+    currentCycleErrors += 1;
+    runtimeStats.errors += 1;
     status.set(product.url, 'unknown');
+    return 'error';
   }
 }
 
@@ -318,6 +386,10 @@ async function searchStoreForSnipe(page, target) {
       `Lazada requires manual verification on seller store page. Please solve it in the browser!`,
       { url: storeUrl, time: new Date().toLocaleTimeString() }
     );
+    runtimeStats.captchas += 1;
+    runtimeStats.lastCaptchaAt = new Date().toISOString();
+    sendControllerMessage({ type: 'captcha', product: target.name, at: runtimeStats.lastCaptchaAt });
+    await waitForManualCaptchaResolution(page.url() || storeUrl);
     return;
   }
 
@@ -384,56 +456,8 @@ async function searchStoreForSnipe(page, target) {
   }
 }
 
-function getScheduleStatus(scheduleConfig) {
-  if (!scheduleConfig || !scheduleConfig.enabled) {
-    return { active: true };
-  }
-
-  const tz = scheduleConfig.timezone || 'Asia/Singapore';
-  const now = new Date();
-
-  // Extract current time in 24-hr format for Singapore timezone
-  const timeFormatter = new Intl.DateTimeFormat('en-GB', {
-    timeZone: tz,
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  });
-
-  const [hourStr, minStr] = timeFormatter.format(now).split(':');
-  const currentMinutes = Number(hourStr) * 60 + Number(minStr);
-
-  const [startH, startM] = (scheduleConfig.startTime || '00:30').split(':').map(Number);
-  const startMinutes = startH * 60 + startM;
-
-  const [endH, endM] = (scheduleConfig.endTime || '14:00').split(':').map(Number);
-  const endMinutes = endH * 60 + endM;
-
-  let isActive = false;
-  if (startMinutes <= endMinutes) {
-    isActive = currentMinutes >= startMinutes && currentMinutes < endMinutes;
-  } else {
-    // Overnight window
-    isActive = currentMinutes >= startMinutes || currentMinutes < endMinutes;
-  }
-
-  let minutesUntilStart = startMinutes - currentMinutes;
-  if (minutesUntilStart <= 0) {
-    minutesUntilStart += 24 * 60;
-  }
-
-  return {
-    active: isActive,
-    timeString: `${hourStr}:${minStr}`,
-    minutesUntilStart,
-    startString: scheduleConfig.startTime || '00:30',
-    endString: scheduleConfig.endTime || '14:00',
-    timezone: tz,
-  };
-}
-
-const activeProducts = (config.products || []).filter((p) => p.enabled !== false);
-const activeSnipeTargets = (config.snipeTargets || []).filter((t) => t.enabled !== false);
+let activeProducts = (config.products || []).filter((p) => p.enabled !== false);
+let activeSnipeTargets = (config.snipeTargets || []).filter((t) => t.enabled !== false);
 
 if (activeProducts.length === 0 && activeSnipeTargets.length === 0) {
   console.log('config.json has no enabled products or snipe targets. Enable at least one item, then run npm start.');
@@ -443,6 +467,38 @@ if (activeProducts.length === 0 && activeSnipeTargets.length === 0) {
 let context = null;
 let monitorPage = null;
 let isShuttingDown = false;
+let runtimeHeadless = !!config.headless;
+
+function reloadRuntimeConfig() {
+  config = JSON.parse(readFileSync(configUrl, 'utf8'));
+  pollIntervalMs = (config.pollIntervalSeconds || 25) * 1000;
+  activeProducts = (config.products || []).filter((product) => product.enabled !== false);
+  activeSnipeTargets = (config.snipeTargets || []).filter((target) => target.enabled !== false);
+  log(
+    `[Config] Reloaded: ${activeProducts.length} product(s), ${activeSnipeTargets.length} snipe target(s), ${config.pollIntervalSeconds || 25}s interval.`
+  );
+  sendTelemetry();
+}
+
+process.on('message', (message) => {
+  if (message?.type === 'reload-config') {
+    try {
+      reloadRuntimeConfig();
+    } catch (err) {
+      log(`[Config] Reload failed: ${err.message}`);
+      sendControllerMessage({ type: 'config-error', error: err.message });
+    }
+  } else if (message?.type === 'check-product' && Number.isInteger(message.index)) {
+    pendingProductCheck = message.index;
+  }
+});
+
+class CaptchaResolvedError extends Error {
+  constructor() {
+    super('CAPTCHA resolved; restart the polling cycle with the visible browser.');
+    this.name = 'CaptchaResolvedError';
+  }
+}
 
 async function cleanup(signal) {
   if (isShuttingDown) return;
@@ -464,7 +520,10 @@ process.on('SIGTERM', () => cleanup('SIGTERM'));
 
 async function ensureBrowserOpen() {
   if (!context) {
-    context = await launch(config);
+    context = await launch(config, {
+      headless: runtimeHeadless,
+      blockImages: runtimeHeadless ? config.blockImages : false,
+    });
     monitorPage = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
   } else if (!monitorPage || monitorPage.isClosed()) {
     monitorPage = await context.newPage();
@@ -485,41 +544,101 @@ async function closeBrowserContext() {
   }
 }
 
-if (config.schedule && config.schedule.enabled) {
-  console.log(`⏰ Schedule Enabled: Active daily from ${config.schedule.startTime || '00:30'} to ${config.schedule.endTime || '14:00'} (${config.schedule.timezone || 'Asia/Singapore'}).`);
+async function waitForManualCaptchaResolution(challengeUrl) {
+  if (runtimeHeadless) {
+    log('[CAPTCHA] Relaunching the browser in visible mode for manual verification...');
+    await closeBrowserContext();
+    runtimeHeadless = false;
+    await ensureBrowserOpen();
+
+    try {
+      await monitorPage.goto(challengeUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    } catch (err) {
+      log(`[CAPTCHA] Challenge page navigation notice: ${err.message}`);
+    }
+  }
+
+  log('[CAPTCHA] Complete the verification in the visible browser. Monitoring is paused.');
+
+  while (monitorPage && !monitorPage.isClosed() && (await isCaptchaOrBlock(monitorPage))) {
+    await randomDelay(2000, 3000);
+  }
+
+  if (!monitorPage || monitorPage.isClosed()) {
+    throw new Error('The visible browser was closed before the CAPTCHA was resolved.');
+  }
+
+  await saveSession(context);
+  log('[CAPTCHA] Verification cleared. Returning to headless monitoring...');
+  await closeBrowserContext();
+  runtimeHeadless = true;
+  await ensureBrowserOpen();
+  log('[CAPTCHA] Headless browser restarted. Resuming monitoring.');
+  notify('CAPTCHA RESOLVED', 'Verification was completed successfully. Lazada monitoring has resumed.', {
+    time: new Date().toLocaleTimeString(),
+  });
+
+  throw new CaptchaResolvedError();
 }
+
+function finishCycle(cycleDurationMs, checkedCount, slowestProduct) {
+  runtimeStats.cycles += 1;
+  runtimeStats.productChecks += checkedCount;
+  runtimeStats.lastCycleDurationMs = cycleDurationMs;
+  runtimeStats.slowestProduct = slowestProduct;
+
+  if (currentCycleErrors === 0) {
+    runtimeStats.lastSuccessfulCycleAt = new Date().toISOString();
+    consecutiveErrorCycles = 0;
+    if (errorAlertActive) {
+      errorAlertActive = false;
+      notify('MONITORING RECOVERED', 'A complete Lazada monitoring cycle finished without errors.', {
+        time: new Date().toLocaleTimeString(),
+      });
+    }
+  } else {
+    consecutiveErrorCycles += 1;
+    const threshold = Math.max(1, Number(config.health?.consecutiveErrorAlertThreshold) || 3);
+    if (consecutiveErrorCycles >= threshold && !errorAlertActive) {
+      errorAlertActive = true;
+      notify(
+        'MONITORING ERRORS',
+        `${consecutiveErrorCycles} consecutive cycles encountered errors. Check /status and the PC logs.`,
+        { time: new Date().toLocaleTimeString() }
+      );
+    }
+  }
+
+  const slowThresholdMs = Math.max(10, Number(config.health?.slowCycleSeconds) || 60) * 1000;
+  if (cycleDurationMs >= slowThresholdMs && Date.now() - lastSlowCycleAlert >= 60 * 60 * 1000) {
+    lastSlowCycleAlert = Date.now();
+    notify(
+      'SLOW MONITORING CYCLE',
+      `The latest cycle took ${Math.round(cycleDurationMs / 1000)}s. Slowest target: ${slowestProduct?.name || 'unknown'} (${Math.round((slowestProduct?.durationMs || 0) / 1000)}s).`,
+      { time: new Date().toLocaleTimeString() }
+    );
+  }
+
+  sendControllerMessage({
+    type: 'cycle',
+    metrics: { durationMs: cycleDurationMs, checkedCount, errors: currentCycleErrors, slowestProduct },
+  });
+  sendTelemetry({ consecutiveErrorCycles });
+}
+
 console.log(`Monitoring ${activeProducts.length} active direct product(s) and ${activeSnipeTargets.length} active storefront snipe target(s) every ${config.pollIntervalSeconds || 10}s.`);
 console.log(`Bot is ${config.headless ? 'headless (silent background)' : 'visible'}.`);
 console.log(`Profile & session stored at: ${DATA_DIR}`);
 if (once) console.log('Running a single check (--once).');
 
 let firstRun = true;
-let wasInActiveWindow = null;
+sendTelemetry({ state: 'running' });
 
 for (;;) {
-  const sched = getScheduleStatus(config.schedule);
-
-  // If outside active schedule window
-  if (!sched.active && !once) {
-    if (wasInActiveWindow !== false) {
-      const hrs = Math.floor(sched.minutesUntilStart / 60);
-      const mins = sched.minutesUntilStart % 60;
-      log(`[Scheduler] 🌙 Current time is ${sched.timeString} ${sched.timezone}. Outside active monitoring window (${sched.startString} - ${sched.endString}).`);
-      log(`[Scheduler] 💤 Sleeping until ${sched.startString} ${sched.timezone} (~${hrs}h ${mins}m remaining). Browser closed to conserve RAM.`);
-      await closeBrowserContext();
-      wasInActiveWindow = false;
-    }
-
-    // Sleep in 30-second increments so user can stop or adjust anytime
-    await randomDelay(30000, 31000);
-    continue;
-  }
-
-  // Inside active schedule window
-  if (wasInActiveWindow === false) {
-    log(`[Scheduler] ☀️ Active monitoring window started (${sched.timeString} ${sched.timezone})! Launching browser...`);
-  }
-  wasInActiveWindow = true;
+  const cycleStartedAt = Date.now();
+  let checkedCount = 0;
+  let slowestProduct = null;
+  currentCycleErrors = 0;
 
   try {
     const { context: ctx, monitorPage: page } = await ensureBrowserOpen();
@@ -531,21 +650,63 @@ for (;;) {
 
     await keepAlive(page);
 
+    if (Number.isInteger(pendingProductCheck)) {
+      const requestedIndex = pendingProductCheck;
+      pendingProductCheck = null;
+      const requestedProduct = (config.products || [])[requestedIndex];
+      if (requestedProduct) {
+        runtimeStats.currentProduct = requestedProduct.name;
+        sendTelemetry({ state: 'manual-check' });
+        const stock = await checkProduct(page, requestedProduct);
+        notify('MANUAL PRODUCT CHECK', `${requestedProduct.name}: ${String(stock).toUpperCase()}`, {
+          url: requestedProduct.url,
+          time: new Date().toLocaleTimeString(),
+        });
+        sendControllerMessage({ type: 'manual-check-result', index: requestedIndex, product: requestedProduct.name, stock });
+      }
+    }
+
     // 1. Check active direct product URLs
     for (const product of activeProducts) {
+      runtimeStats.currentProduct = product.name;
+      sendTelemetry({ state: 'checking' });
+      const checkStartedAt = Date.now();
       await checkProduct(page, product);
+      const durationMs = Date.now() - checkStartedAt;
+      checkedCount += 1;
+      if (!slowestProduct || durationMs > slowestProduct.durationMs) {
+        slowestProduct = { name: product.name, durationMs };
+      }
       await randomDelay(800, 1500); // Jitter between multi-product checks
     }
 
     // 2. Check active storefront snipe targets
     for (const snipeTarget of activeSnipeTargets) {
+      runtimeStats.currentProduct = `[Sniper] ${snipeTarget.name}`;
+      sendTelemetry({ state: 'checking' });
+      const checkStartedAt = Date.now();
       await searchStoreForSnipe(page, snipeTarget);
+      const durationMs = Date.now() - checkStartedAt;
+      checkedCount += 1;
+      if (!slowestProduct || durationMs > slowestProduct.durationMs) {
+        slowestProduct = { name: `[Sniper] ${snipeTarget.name}`, durationMs };
+      }
       await randomDelay(800, 1500);
     }
 
     await saveSession(ctx);
+    runtimeStats.currentProduct = null;
+    finishCycle(Date.now() - cycleStartedAt, checkedCount, slowestProduct);
   } catch (loopErr) {
-    log(`Loop error: ${loopErr.message}`);
+    if (loopErr instanceof CaptchaResolvedError) {
+      log('[CAPTCHA] Starting a fresh polling cycle after verification.');
+    } else {
+      log(`Loop error: ${loopErr.message}`);
+      currentCycleErrors += 1;
+      runtimeStats.errors += 1;
+      runtimeStats.currentProduct = null;
+      finishCycle(Date.now() - cycleStartedAt, checkedCount, slowestProduct);
+    }
   }
 
   if (once) break;
@@ -554,5 +715,3 @@ for (;;) {
 
 await closeBrowserContext();
 process.exit(0);
-
-

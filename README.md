@@ -21,10 +21,12 @@ Instantly alerts you and auto-adds items to cart the moment they restock — or 
 | 🎯 **Accurate Stock Detection** | Selects the correct variant *before* checking the Add to Cart button — no false positives |
 | 🔍 **Storefront Sniper** | Continuously scans a seller's store for newly published listings matching your keywords |
 | 📱 **Telegram Alerts** | Instant mobile push notifications with product link when stock is detected |
+| 🩺 **Health Telemetry** | Reports current target, cycle timing, errors, login state, CAPTCHA history, and recovery |
+| 🎛️ **Telegram Controls** | Start/end monitoring, manage products, run manual checks, and adjust safe settings remotely |
+| ♻️ **Crash Recovery** | Restarts unexpected monitor crashes up to three times within 15 minutes |
 | 🛡️ **Anti-Bot Stealth** | Masks `navigator.webdriver`, applies human-like delays and randomized jitter |
 | ⚠️ **CAPTCHA Detection** | Detects Lazada slide verification and immediately alerts you to solve it |
 | 🔢 **Multi-Quantity Support** | Uses the page quantity stepper before clicking Add to Cart |
-| ⏰ **Built-in Scheduler** | Auto-starts and auto-stops monitoring on a configurable daily time window |
 | 💤 **Resource Efficient** | Headless mode, image/media blocking, and page recycling keeps CPU/RAM usage minimal |
 | 🔒 **Secure Credentials** | Telegram secrets loaded from `.env` — never committed to Git |
 
@@ -62,11 +64,9 @@ TELEGRAM_CHAT_ID=your_chat_id_here
   "headless": true,
   "pollIntervalSeconds": 10,
   "blockImages": true,
-  "schedule": {
-    "enabled": true,
-    "startTime": "00:30",
-    "endTime": "14:00",
-    "timezone": "Asia/Singapore"
+  "health": {
+    "slowCycleSeconds": 60,
+    "consecutiveErrorAlertThreshold": 3
   },
   "notifications": {
     "sound": false,
@@ -109,13 +109,40 @@ npm run login
 
 A browser window will open. Sign in to your Lazada account, then press **Enter** in the terminal. Your session is saved to `%LOCALAPPDATA%\lazada-stock-bot` (outside OneDrive to prevent file lock corruption).
 
-### 5. Start Monitoring
+### 5. Start the Telegram Controller
 
 ```bash
 npm start
 ```
 
-The bot will run silently in the background, checking every 10 seconds within the configured schedule window.
+This starts only the Telegram controller; monitoring remains stopped until `/start_monitor` is sent. The controller must already be running on the PC to receive Telegram commands, so Telegram cannot bootstrap `npm start` while the controller is offline.
+
+Available Telegram commands:
+
+```text
+/start_monitor
+/end_monitor
+/status
+/summary
+/list_products
+/enable_product N
+/disable_product N
+/check_product N
+/list_snipe_targets
+/toggle_snipe N
+/set_interval SECONDS
+/set_quantity N QTY
+/show_config
+/help
+```
+
+`/start_monitor` begins monitoring immediately and it continues until `/end_monitor` is sent. Only the chat ID configured through `TELEGRAM_CHAT_ID` is allowed to issue commands.
+
+Configuration commands update `config.json` atomically and notify a running monitor to reload it. `/set_interval` accepts 15–300 seconds. `/set_quantity` accepts quantities from 1–99. The controller sends an automatic summary every 24 hours when activity occurred; `/summary` shows the current totals at any time.
+
+Use `/list_snipe_targets` to see each configured storefront target and `/toggle_snipe N` to switch target `N` on or off.
+
+Unexpected monitor exits are restarted after five seconds, up to three times in a 15-minute window. `/end_monitor` is treated as an intentional stop and never triggers recovery.
 
 ---
 
@@ -152,22 +179,7 @@ You should receive a Telegram message and see a Windows toast notification.
 
 ---
 
-## ⏰ Scheduler
-
-The bot has a built-in daily scheduler so it only runs during your target window and automatically shuts down the browser outside of it to save RAM.
-
-Configure in `config.json`:
-
-```json
-"schedule": {
-  "enabled": true,
-  "startTime": "00:30",
-  "endTime": "14:00",
-  "timezone": "Asia/Singapore"
-}
-```
-
-Set `"enabled": false` to disable scheduling and run 24/7.
+If a CAPTCHA is detected while running headlessly, the bot automatically relaunches its saved browser profile in visible mode and pauses monitoring. Complete the verification in that browser window; once the challenge disappears, the bot saves the updated session, closes the visible browser, and resumes monitoring headlessly.
 
 ---
 
@@ -201,7 +213,10 @@ Set `"enabled": false` to disable a snipe target without removing it.
 
 | Command | Description |
 |---|---|
-| `npm start` | Start the stock monitor |
+| `npm start` | Start the Telegram controller; monitoring remains stopped |
+| `npm run start:monitor` | Start only the stock monitor without Telegram command polling |
+| `npm run setup:autostart` | Install controller startup at Windows logon |
+| `npm run remove:autostart` | Remove the Windows startup task |
 | `npm run login` | Open browser to log in to Lazada |
 | `npm run test:notify` | Test Windows toast + Telegram notification |
 | `node src/monitor.js --once` | Run a single check cycle and exit |
@@ -215,10 +230,12 @@ Set `"enabled": false` to disable a snipe target without removing it.
 lazada-stock-bot/
 ├── src/
 │   ├── monitor.js      # Main polling loop, stock detection, sniper
+│   ├── controller.js   # Telegram commands, telemetry, crash recovery
 │   ├── browser.js      # Playwright launcher with stealth & image blocking
 │   ├── login.js        # Interactive Lazada login script
 │   └── notify.js       # Telegram + Windows Toast notifications
-├── config.json         # Products, schedule, and settings (safe to commit)
+├── scripts/            # Opt-in Windows startup setup/removal
+├── config.json         # Products and settings (safe to commit)
 ├── .env                # 🔒 Secret Telegram credentials (gitignored)
 ├── .env.example        # Template for .env
 └── package.json
@@ -233,9 +250,22 @@ lazada-stock-bot/
 | `headless` | `true` | Run browser invisibly in background |
 | `pollIntervalSeconds` | `10` | How often to check each product (seconds) |
 | `blockImages` | `true` | Block images/videos for faster page loads |
-| `schedule.enabled` | `true` | Enable/disable the daily time window |
-| `schedule.startTime` | `"00:30"` | Time to start monitoring (24h, SGT) |
-| `schedule.endTime` | `"14:00"` | Time to stop monitoring (24h, SGT) |
+| `health.slowCycleSeconds` | `60` | Alert threshold for an unusually slow complete cycle |
+| `health.consecutiveErrorAlertThreshold` | `3` | Consecutive error cycles before alerting |
 | `product.variantLabel` | `null` | Variant text to click (e.g. `"Series 3"`) |
 | `product.quantity` | `1` | Number of items to add to cart |
 | `snipeTarget.enabled` | `true` | Toggle individual snipe targets on/off |
+
+## Windows automatic controller startup
+
+To keep Telegram commands available after you sign into Windows, install the opt-in scheduled task:
+
+```powershell
+npm run setup:autostart
+```
+
+This starts only the controller at Windows logon. Monitoring still waits for `/start_monitor`. Remove the task with:
+
+```powershell
+npm run remove:autostart
+```

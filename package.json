@@ -6,7 +6,10 @@
   "type": "module",
   "scripts": {
     "login": "node src/login.js",
-    "start": "node src/monitor.js",
+    "start": "node src/controller.js",
+    "start:monitor": "node src/monitor.js",
+    "setup:autostart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-autostart.ps1",
+    "remove:autostart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/remove-autostart.ps1",
     "test:notify": "node src/notify.js"
   },
   "dependencies": {
